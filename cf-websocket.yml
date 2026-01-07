@@ -1,0 +1,509 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "VPC with CloudFront + ALB + EC2 (HTTP/WebSocket Server) - 動作検証用"
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: workshop
+    Description: Environment name prefix
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    Description: EC2 instance type
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Latest Amazon Linux 2023 AMI
+
+Resources:
+  # ============================================================
+  # VPC
+  # ============================================================
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-vpc"
+
+  # ============================================================
+  # Subnets
+  # ============================================================
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-public-subnet-1"
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-public-subnet-2"
+
+  # ============================================================
+  # Internet Gateway
+  # ============================================================
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-igw"
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # ============================================================
+  # Route Tables
+  # ============================================================
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-public-rt"
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # ============================================================
+  # Security Groups
+  # ============================================================
+
+  # ALB用セキュリティグループ
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "ALB SG - HTTP/HTTPS from anywhere"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: "HTTP from anywhere"
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-alb-sg"
+
+  # EC2用セキュリティグループ
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "EC2 SG - HTTP from ALB only"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: "HTTP from ALB"
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-ec2-sg"
+
+  # ============================================================
+  # IAM Role for EC2 (SSM接続用)
+  # ============================================================
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-ec2-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-ec2-role"
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${EnvironmentName}-ec2-profile"
+      Roles:
+        - !Ref EC2Role
+
+  # ============================================================
+  # EC2 Instance (Python HTTP/WebSocket Server)
+  # ============================================================
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref LatestAmiId
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-server"
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+
+          # ログ出力
+          exec > >(tee /var/log/user-data.log) 2>&1
+          echo "Starting setup..."
+
+          # Python環境セットアップ
+          dnf install -y python3.11 python3.11-pip
+
+          # アプリケーションディレクトリ作成
+          mkdir -p /opt/app
+          cd /opt/app
+
+          # Pythonサーバーコード作成
+          cat > server.py << 'PYTHON_CODE'
+          import asyncio
+          import json
+          from aiohttp import web, WSMsgType
+          from datetime import datetime
+
+          # 接続中のWebSocketクライアント
+          ws_clients = set()
+
+          async def health_check(request):
+              """ヘルスチェック用エンドポイント"""
+              return web.json_response({"status": "healthy", "timestamp": datetime.now().isoformat()})
+
+          async def index(request):
+              """トップページ - 動作確認用HTML"""
+              html = """
+          <!DOCTYPE html>
+          <html>
+          <head>
+              <title>HTTP/WebSocket Demo</title>
+              <style>
+                  body { font-family: Arial, sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; }
+                  .box { border: 1px solid #ddd; padding: 20px; margin: 20px 0; border-radius: 8px; }
+                  .success { background: #d4edda; border-color: #c3e6cb; }
+                  .info { background: #cce5ff; border-color: #b8daff; }
+                  button { padding: 10px 20px; margin: 5px; cursor: pointer; }
+                  #messages { height: 200px; overflow-y: auto; border: 1px solid #ccc; padding: 10px; }
+                  .msg { padding: 5px; margin: 2px 0; background: #f8f9fa; }
+              </style>
+          </head>
+          <body>
+              <h1>🚀 HTTP/WebSocket Demo Server</h1>
+              
+              <div class="box success">
+                  <h2>✅ HTTP 動作確認</h2>
+                  <p>このページが表示されていれば、HTTPは正常に動作しています！</p>
+                  <p><strong>経路:</strong> CloudFront → ALB → EC2 (Python)</p>
+              </div>
+              
+              <div class="box info">
+                  <h2>🔌 WebSocket 動作確認</h2>
+                  <p>下のボタンでWebSocket接続をテストできます。</p>
+                  <button onclick="connectWS()">WebSocket接続</button>
+                  <button onclick="sendMessage()">メッセージ送信</button>
+                  <button onclick="disconnectWS()">切断</button>
+                  <p>Status: <span id="status">未接続</span></p>
+                  <div id="messages"></div>
+              </div>
+              
+              <div class="box">
+                  <h2>📡 APIエンドポイント</h2>
+                  <ul>
+                      <li><a href="/health">/health</a> - ヘルスチェック</li>
+                      <li><a href="/api/info">/api/info</a> - サーバー情報</li>
+                      <li>/ws - WebSocket接続</li>
+                  </ul>
+              </div>
+              
+              <script>
+                  let ws = null;
+                  const statusEl = document.getElementById('status');
+                  const messagesEl = document.getElementById('messages');
+                  
+                  function log(msg) {
+                      const div = document.createElement('div');
+                      div.className = 'msg';
+                      div.textContent = new Date().toLocaleTimeString() + ' - ' + msg;
+                      messagesEl.appendChild(div);
+                      messagesEl.scrollTop = messagesEl.scrollHeight;
+                  }
+                  
+                  function connectWS() {
+                      const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+                      const wsUrl = protocol + '//' + location.host + '/ws';
+                      log('Connecting to ' + wsUrl);
+                      
+                      ws = new WebSocket(wsUrl);
+                      ws.onopen = () => { statusEl.textContent = '接続中 ✅'; log('Connected!'); };
+                      ws.onmessage = (e) => log('Received: ' + e.data);
+                      ws.onclose = () => { statusEl.textContent = '切断 ❌'; log('Disconnected'); };
+                      ws.onerror = (e) => log('Error: ' + e.message);
+                  }
+                  
+                  function sendMessage() {
+                      if (ws && ws.readyState === WebSocket.OPEN) {
+                          const msg = 'Hello from browser! ' + new Date().toISOString();
+                          ws.send(msg);
+                          log('Sent: ' + msg);
+                      } else {
+                          log('Not connected');
+                      }
+                  }
+                  
+                  function disconnectWS() {
+                      if (ws) ws.close();
+                  }
+              </script>
+          </body>
+          </html>
+              """
+              return web.Response(text=html, content_type='text/html')
+
+          async def api_info(request):
+              """API情報"""
+              return web.json_response({
+                  "service": "HTTP/WebSocket Demo",
+                  "version": "1.0",
+                  "endpoints": ["/", "/health", "/api/info", "/ws"],
+                  "timestamp": datetime.now().isoformat()
+              })
+
+          async def websocket_handler(request):
+              """WebSocketハンドラー"""
+              ws = web.WebSocketResponse()
+              await ws.prepare(request)
+              
+              ws_clients.add(ws)
+              print(f"WebSocket connected. Total clients: {len(ws_clients)}")
+              
+              await ws.send_str(json.dumps({"type": "welcome", "message": "WebSocket connected!"}))
+              
+              try:
+                  async for msg in ws:
+                      if msg.type == WSMsgType.TEXT:
+                          print(f"Received: {msg.data}")
+                          # エコーバック + タイムスタンプ
+                          response = {
+                              "type": "echo",
+                              "original": msg.data,
+                              "timestamp": datetime.now().isoformat()
+                          }
+                          await ws.send_str(json.dumps(response))
+                      elif msg.type == WSMsgType.ERROR:
+                          print(f"WebSocket error: {ws.exception()}")
+              finally:
+                  ws_clients.discard(ws)
+                  print(f"WebSocket disconnected. Total clients: {len(ws_clients)}")
+              
+              return ws
+
+          app = web.Application()
+          app.router.add_get('/', index)
+          app.router.add_get('/health', health_check)
+          app.router.add_get('/api/info', api_info)
+          app.router.add_get('/ws', websocket_handler)
+
+          if __name__ == '__main__':
+              print("Starting server on port 8080...")
+              web.run_app(app, host='0.0.0.0', port=8080)
+          PYTHON_CODE
+
+          # 依存パッケージインストール
+          python3.11 -m pip install aiohttp
+
+          # systemdサービス作成
+          cat > /etc/systemd/system/webserver.service << 'SERVICE'
+          [Unit]
+          Description=Python HTTP/WebSocket Server
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=root
+          WorkingDirectory=/opt/app
+          ExecStart=/usr/bin/python3.11 /opt/app/server.py
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+          SERVICE
+
+          # サービス起動
+          systemctl daemon-reload
+          systemctl enable webserver
+          systemctl start webserver
+
+          echo "Setup complete!"
+
+  # ============================================================
+  # Application Load Balancer
+  # ============================================================
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${EnvironmentName}-alb"
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-alb"
+
+  # Target Group (EC2インスタンス用)
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${EnvironmentName}-tg"
+      Port: 8080
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: instance
+      HealthCheckEnabled: true
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      # WebSocket用: スティッキーセッション有効化
+      TargetGroupAttributes:
+        - Key: stickiness.enabled
+          Value: "true"
+        - Key: stickiness.type
+          Value: lb_cookie
+        - Key: stickiness.lb_cookie.duration_seconds
+          Value: "86400"
+      Targets:
+        - Id: !Ref EC2Instance
+          Port: 8080
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-tg"
+
+  # ALB Listener
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+
+  # ============================================================
+  # CloudFront Distribution
+  # ============================================================
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        HttpVersion: http2
+        Comment: !Sub "${EnvironmentName} - HTTP/WebSocket Demo"
+        Origins:
+          - DomainName: !GetAtt ALB.DNSName
+            Id: ALBOrigin
+            CustomOriginConfig:
+              HTTPPort: 80
+              OriginProtocolPolicy: http-only
+        DefaultCacheBehavior:
+          TargetOriginId: ALBOrigin
+          ViewerProtocolPolicy: allow-all
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+            - PUT
+            - POST
+            - PATCH
+            - DELETE
+          CachedMethods:
+            - GET
+            - HEAD
+          # キャッシュ無効化（動的コンテンツ用）
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3
+
+Outputs:
+  # アクセスURL
+  CloudFrontURL:
+    Description: "🌐 アクセスURL (CloudFront)"
+    Value: !Sub "http://${CloudFrontDistribution.DomainName}"
+
+  ALBURL:
+    Description: "🔗 ALB直接アクセスURL"
+    Value: !Sub "http://${ALB.DNSName}"
+
+  # 動作確認コマンド
+  TestCommands:
+    Description: "📋 動作確認コマンド"
+    Value: !Sub |
+      # HTTP確認
+      curl http://${CloudFrontDistribution.DomainName}/health
+
+      # WebSocket確認 (wscatインストール: npm install -g wscat)
+      wscat -c ws://${CloudFrontDistribution.DomainName}/ws
+
+  # リソース情報
+  VPCId:
+    Description: VPC ID
+    Value: !Ref VPC
+
+  EC2InstanceId:
+    Description: EC2 Instance ID
+    Value: !Ref EC2Instance
+
+  EC2PrivateIP:
+    Description: EC2 Private IP
